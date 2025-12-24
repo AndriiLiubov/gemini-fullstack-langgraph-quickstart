@@ -23,7 +23,7 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from agent.utils import (
     get_citations,
     get_research_topic,
@@ -34,7 +34,10 @@ from agent.utils import (
 load_dotenv()
 
 if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+    raise ValueError("GEMINI_API_KEY is not set (required for Google Search)")
+
+if os.getenv("GROQ_API_KEY") is None:
+    raise ValueError("GROQ_API_KEY is not set (required for LLM reasoning)")
 
 # Used for Google Search API
 genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -42,10 +45,9 @@ genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
-    """LangGraph node that generates search queries based on the User's question.
+    """Generates search queries using Groq LLM.
 
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
-    the User's question.
+    All reasoning is performed via Groq. Gemini is not used in this step.
 
     Args:
         state: Current graph state containing the User's question
@@ -61,11 +63,11 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
     # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
+    llm = ChatGroq(
+        model=configurable.llm_model,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("GROQ_API_KEY"),
     )
     structured_llm = llm.with_structured_output(SearchQueryList)
 
@@ -93,47 +95,81 @@ def continue_to_web_research(state: QueryGenerationState):
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
+    """Fetches raw search results via Gemini Google Search grounding.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Gemini is used strictly as a transport layer to retrieve search URLs and titles.
+    All reasoning, summarization, and extraction is handled by Groq.
 
     Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
+        state: Current graph state containing the search query and ID.
+        config: Runnable configuration (not used here but required by interface).
 
     Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
+        Dictionary with state updates including:
+            - "sources_gathered": list of sources found.
+            - "search_query": the original search queries.
+            - "web_research_result": list of retrieved and annotated text.
     """
-    # Configure
-    configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-    )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
+    configurable = Configuration.from_runnable_config(config)
+
+    # 1. Execute Google Search via Gemini (transport only)
     response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
+        model=configurable.search_model,
+        contents=state["search_query"], 
         config={
             "tools": [{"google_search": {}}],
             "temperature": 0,
         },
     )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
+
+    # 2. Extract grounding metadata only (titles and URLs)
+    grounding_chunks = response.candidates[0].grounding_metadata.grounding_chunks
+
+    resolved_urls = resolve_urls(grounding_chunks, state["id"])
+
+    # 3. Build raw evidence text using ONLY Groq
+    evidence_sources = []
+    for chunk in grounding_chunks:
+        # Проверяем наличие web-атрибута
+        if hasattr(chunk, "web") and chunk.web:
+            web_info = chunk.web
+            title = getattr(web_info, "title", "")
+            uri = getattr(web_info, "uri", "")
+            if title or uri:
+                evidence_sources.append(f"{title}\n{uri}")
+
+    raw_evidence = "\n\n".join(evidence_sources)
+
+    # 4. Summarize evidence using Groq
+    llm = ChatGroq(
+        model=configurable.llm_model,
+        temperature=0,
+        max_retries=2,
+        api_key=os.getenv("GROQ_API_KEY"),
     )
-    # Gets the citations and adds them to the generated text
+
+    summary_prompt = f"""
+    Summarize the following search evidence factually.
+    Do not add any information not present in the text.
+
+    Evidence:
+    {raw_evidence}
+    """
+
+    summary = llm.invoke(summary_prompt).content
+
+    # 5. Attach citations AFTER Groq reasoning (using resolved URLs)
     citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+    final_text = insert_citation_markers(summary, citations)
+    sources_gathered = [item for c in citations for item in c["segments"]]
 
     return {
         "sources_gathered": sources_gathered,
         "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
+        "web_research_result": [final_text],
     }
+
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
@@ -153,7 +189,7 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     configurable = Configuration.from_runnable_config(config)
     # Increment the research loop count and get the reasoning model
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model", configurable.reflection_model)
+    reasoning_model = state.get("reasoning_model", configurable.llm_model)
 
     # Format the prompt
     current_date = get_current_date()
@@ -163,11 +199,11 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
+    llm = ChatGroq(
         model=reasoning_model,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("GROQ_API_KEY"),
     )
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
@@ -231,7 +267,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         Dictionary with state update, including running_summary key containing the formatted final summary with sources
     """
     configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.answer_model
+    reasoning_model = state.get("reasoning_model", configurable.llm_model)
 
     # Format the prompt
     current_date = get_current_date()
@@ -242,11 +278,11 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     )
 
     # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
+    llm = ChatGroq(
         model=reasoning_model,
         temperature=0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("GROQ_API_KEY"),
     )
     result = llm.invoke(formatted_prompt)
 
