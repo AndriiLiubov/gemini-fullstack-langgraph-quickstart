@@ -19,6 +19,7 @@ class OverallState(TypedDict):
     max_research_loops: int
     research_loop_count: int
     reasoning_model: str
+    search_dir: str
 
 
 class ReflectionState(TypedDict):
@@ -27,20 +28,23 @@ class ReflectionState(TypedDict):
     follow_up_queries: Annotated[list, operator.add]
     research_loop_count: int
     number_of_ran_queries: int
+    search_dir: str 
 
 
 class Query(TypedDict):
     query: str
     rationale: str
+    search_dir: str
 
 
 class QueryGenerationState(TypedDict):
     search_query: list[Query]
-
+    search_dir: str
 
 class WebSearchState(TypedDict):
     search_query: str
     id: str
+    search_dir: str
 
 
 @dataclass(kw_only=True)
